@@ -68,18 +68,24 @@ function(Symbols,what=standardQuote(),...) {
     Qposix <- .POSIXct(sq[,"regularMarketTime"], tz=tz[1L])
   } else {
     warning("symbols have different timezones; converting to local time")
-    convertTZ <- function(x) {
-      tz <- x$exchangeTimezoneName[1]
-      times <- .POSIXct(x$regularMarketTime, tz)
-      attr(times, "tzone") <- NULL
-      times
-    }
-    Qposix <- sapply(split(sq, sq$exchangeTimezoneName), convertTZ)
-    Qposix <- .POSIXct(Qposix, tz=NULL)  # force local timezone
+    Qposix <- .POSIXct(sq$regularMarketTime, tz = NULL)  # force local timezone
   }
 
   Symbols <- unlist(strsplit(Symbols,','))
-  df <- data.frame(Qposix, sq[,QF])
+
+  # Extract user-requested columns. Convert to list to avoid
+  # 'undefined column' error with data.frame.
+  qflist <- setNames(as.list(sq)[QF], QF)
+
+  # Fill any missing columns with NA
+  pad <- rep(NA, length(Symbols))
+  qflist <- lapply(qflist, function(e) if (is.null(e)) pad else e)
+
+  # Add the trade time and setNames() on other elements
+  qflist <- c(list(regularMarketTime = Qposix), setNames(qflist, QF))
+
+  df <- data.frame(qflist, stringsAsFactors = FALSE, check.names = FALSE)
+
   rownames(df) <- Symbols
   if(!is.null(QF.names)) {
     colnames(df) <- c('Trade Time',QF.names)
@@ -267,3 +273,112 @@ matrix(c(
   #"Error Indication (returned for symbol changed / invalid)", "Error Indication (returned for symbol changed / invalid)", "e1",
   ),
 ncol = 3, byrow = TRUE, dimnames = list(NULL, c("name", "shortname", "field")))
+
+getQuote.av <- function(Symbols, api.key, ...) {
+  importDefaults("getQuote.av")
+  if(!hasArg("api.key")) {
+    stop("getQuote.av: An API key is required (api.key). Free registration,",
+         " at https://www.alphavantage.co/.", call.=FALSE)
+  }
+  URL <- paste0("https://www.alphavantage.co/query",
+                "?function=BATCH_STOCK_QUOTES",
+                "&apikey=", api.key,
+                "&symbols=")
+  # av supports batches of 100
+  nSymbols <- length(Symbols)
+  result <- NULL
+  for(i in seq(1, nSymbols, 100)) {
+    if(i > 1) {
+      Sys.sleep(0.25)
+      cat("getQuote.av downloading batch", i, ":", i + 99, "\n")
+    }
+    batchSymbols <- Symbols[i:min(nSymbols, i + 99)]
+    batchURL <- paste0(URL, paste(batchSymbols, collapse = ","))
+    response <- jsonlite::fromJSON(batchURL)
+
+    if(NROW(response[["Stock Quotes"]]) < 1) {
+      syms <- paste(batchSymbols, collapse = ", ")
+      stop("No data for symbols: ", syms)
+    }
+
+    if(is.null(result)) {
+      result <- response[["Stock Quotes"]]
+    } else {
+      result <- rbind(result, response[["Stock Quotes"]])
+    }
+  }
+  colnames(result) <- c("Symbol", "Last", "Volume", "Trade Time")
+  result$Volume <- suppressWarnings(as.numeric(result$Volume))
+  result$Last <- as.numeric(result$Last)
+  quoteTZ <- response[["Meta Data"]][["3. Time Zone"]]
+  result$`Trade Time` <- as.POSIXct(result$`Trade Time`, tz = quoteTZ)
+
+  # merge join to produce empty rows for missing results from AV
+  # so that return value has the same rows and order as the input
+  output <- merge(data.frame(Symbol = Symbols), result,
+                  by = "Symbol", all.x = TRUE)
+  rownames(output) <- output$Symbol
+  return(output[, c("Trade Time", "Last", "Volume")])
+}
+
+`getQuote.tiingo` <- function(Symbols, api.key, ...) {
+  # docs: https://api.tiingo.com/docs/iex/realtime
+  # NULL Symbols will retrieve quotes for all symbols 
+  importDefaults("getQuote.tiingo")
+  if(!hasArg("api.key")) {
+    stop("getQuote.tiingo: An API key is required (api.key). ",
+         "Registration at https://api.tiingo.com/.", call. = FALSE)
+  }
+
+  base.url <- paste0("https://api.tiingo.com/iex/?token=", api.key)
+  r <- NULL
+  if(is.null(Symbols)) {
+    batch.size <- 1L
+    batch.length <- 1L
+  } else {
+    batch.size <- 100L
+    batch.length <- length(Symbols)
+  }
+
+  for(i in seq(1L, batch.length, batch.size)) {
+    batch.end <- min(batch.length, i + batch.size - 1L)
+    if(i > 1L) {
+      Sys.sleep(0.25)
+      cat("getQuote.tiingo downloading batch", i, ":", batch.end, "\n")
+    }
+
+    if(is.null(Symbols)) {
+      batch.url <- base.url
+    } else {
+      batch.url <- paste0(base.url, "&tickers=", paste(Symbols[i:batch.end], collapse = ","))
+    }
+
+    batch.result <- jsonlite::fromJSON(batch.url)
+
+    if(NROW(batch.result) < 1) {
+      syms <- paste(Symbols[i:batch.end], collapse = ", ")
+      stop("No data for symbols: ", syms)
+    }
+
+    # do type conversions for each batch so we don't get issues with rbind
+    for(cn in colnames(batch.result)) {
+      if(grepl("timestamp", cn, ignore.case = TRUE)) {
+        batch.result[, cn] <- as.POSIXct(batch.result[, cn])
+      }
+      else if(cn != "ticker") {
+        batch.result[, cn] <- as.numeric(batch.result[, cn])
+      }
+    }
+    r <- rbind(r, batch.result)
+  }
+
+  colnames(r) <- gsub("(^[[:alpha:]])", "\\U\\1", colnames(r), perl = TRUE)
+  r[, "Trade Time"] <- r[, "LastSaleTimestamp"]
+
+  # merge join to produce empty rows for missing results from AV
+  # so that return value has the same number of rows and order as the input
+  if(!is.null(Symbols)) r <- merge(data.frame(Ticker = Symbols), r, by = "Ticker", all.x = TRUE)
+  rownames(r) <- r$Ticker
+  std.cols <- c("Trade Time", "Open", "High", "Low", "Last", "Volume")
+  return(r[, c(std.cols, setdiff(colnames(r), c(std.cols, "Ticker")))])
+}
